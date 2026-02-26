@@ -72,13 +72,13 @@ class LanguageClassifier:
         self._speechbrain_classifier = None
         self._backend = "none"
 
-        # --- Try Whisper-tiny first ---
+        # --- Try Whisper-base first (better accuracy for Indian languages) ---
         try:
             import whisper
-            print("Loading Whisper-tiny for language detection (CPU)...")
-            self._whisper_model = whisper.load_model("tiny", device="cpu")
+            print("Loading Whisper-base for language detection (CPU)...")
+            self._whisper_model = whisper.load_model("base", device="cpu")
             self._backend = "whisper"
-            print("Whisper-tiny loaded successfully.")
+            print("Whisper-base loaded successfully.")
         except ImportError:
             print("openai-whisper not installed. Trying SpeechBrain fallback...")
         except Exception as e:
@@ -145,60 +145,76 @@ class LanguageClassifier:
 
     def _predict_whisper(self, file_path: str, timestamps: list) -> tuple:
         """
-        Uses Whisper's internal language detection on speech-only audio.
-        Whisper is run in detect_language mode (no transcription) for speed.
+        Uses Whisper-base language detection with multi-chunk majority voting.
+
+        Strategy: split the available speech into up to N_CHUNKS independent
+        30-second windows. Each window casts a probability-weighted "vote" for
+        a language. The language with the highest cumulative vote wins.
+        This is far more robust than a single-pass for acoustically similar
+        languages (e.g. Tamil vs Telugu — both Dravidian, similar phonemes).
         """
         try:
             import whisper
+            from collections import defaultdict
 
-            # Load audio and collect speech-only segments
+            # Load audio and collect all speech-only samples into a flat array
             signal, sr = torchaudio.load(file_path)
             if sr != 16000:
                 resampler = torchaudio.transforms.Resample(sr, 16000)
                 signal = resampler(signal)
 
-            # Take up to 30 seconds of speech for better detection
             speech_chunks = []
-            collected = 0.0
-            MAX_SEC = 30.0
             for ts in timestamps:
-                if collected >= MAX_SEC:
-                    break
                 start_idx = int(ts["start"] * 16000)
-                end_idx = int(ts["end"] * 16000)
+                end_idx   = int(ts["end"]   * 16000)
                 if start_idx < signal.shape[1]:
                     end_idx = min(end_idx, signal.shape[1])
-                    chunk = signal[:, start_idx:end_idx]
-                    speech_chunks.append(chunk)
-                    collected += (end_idx - start_idx) / 16000.0
+                    speech_chunks.append(signal[:, start_idx:end_idx])
 
             if not speech_chunks:
                 return "Unknown", 0.0
 
             speech_signal = torch.cat(speech_chunks, dim=1)
-
-            # Convert to mono float32 numpy (Whisper expects 16kHz mono numpy array)
             audio_np = speech_signal.mean(dim=0).numpy().astype(np.float32)
 
-            # Pad/trim to Whisper's 30s window (480000 samples) for best results
-            WHISPER_SAMPLES = 480000
-            if len(audio_np) < WHISPER_SAMPLES:
-                audio_np = np.pad(audio_np, (0, WHISPER_SAMPLES - len(audio_np)))
+            # ---- Multi-chunk majority voting ----
+            WHISPER_SAMPLES = 480000   # 30s at 16kHz
+            N_CHUNKS = 3               # vote across up to 3 windows
+            total_len = len(audio_np)
+
+            # Build up to N_CHUNKS non-overlapping 30s windows
+            windows = []
+            if total_len <= WHISPER_SAMPLES:
+                # Only one window possible — pad to 30s
+                windows.append(np.pad(audio_np, (0, WHISPER_SAMPLES - total_len)))
             else:
-                audio_np = audio_np[:WHISPER_SAMPLES]
+                step = total_len // N_CHUNKS
+                for i in range(N_CHUNKS):
+                    start = i * step
+                    end   = start + WHISPER_SAMPLES
+                    if end > total_len:
+                        chunk = np.pad(audio_np[start:], (0, end - total_len))
+                    else:
+                        chunk = audio_np[start:end]
+                    windows.append(chunk)
 
-            # Run Whisper language detection
-            audio_tensor = whisper.pad_or_trim(audio_np)
-            mel = whisper.log_mel_spectrogram(audio_tensor).to("cpu")
+            # Accumulate probability votes across windows
+            votes: dict = defaultdict(float)
+            for window in windows:
+                audio_tensor = whisper.pad_or_trim(window)
+                mel = whisper.log_mel_spectrogram(audio_tensor).to("cpu")
+                _, probs = self._whisper_model.detect_language(mel)
+                # Add each language's probability as its vote weight
+                for lang_code, prob in probs.items():
+                    votes[lang_code] += float(prob)
 
-            _, probs = self._whisper_model.detect_language(mel)
+            # Winning language = highest cumulative vote
+            best_lang_code = max(votes, key=votes.get)
+            # Normalize confidence to [0, 1] by averaging over windows
+            confidence = votes[best_lang_code] / len(windows)
 
-            # Get best language
-            best_lang_code = max(probs, key=probs.get)
-            confidence = float(probs[best_lang_code])
-
-            # Map code to full name
             lang_name = LANGUAGE_NAME_MAP.get(best_lang_code, best_lang_code.upper())
+            print(f"[Lang] Voted: {lang_name} ({best_lang_code}) over {len(windows)} chunk(s), conf={confidence:.3f}")
 
             return lang_name, round(confidence, 4)
 
