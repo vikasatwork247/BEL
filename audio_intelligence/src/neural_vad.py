@@ -90,16 +90,17 @@ def _refine_segment_boundaries(audio: np.ndarray, start_sample: int, end_sample:
     return refined_start, refined_end
 
 
-def run_neural_vad(file_path: str):
+def run_neural_vad(file_path: str) -> List[Tuple[float, float]]:
     """
-    Runs Silero VAD on the audio file with:
-    - Pre-VAD music/noise gate to suppress non-speech frames
-    - Tighter VAD parameters for better precision
-    - Post-VAD boundary refinement for accurate timestamps
-    - Chunk-based processing (5 min segments) for low RAM usage
+    Runs Silero VAD on a PRE-STANDARDIZED (16kHz mono PCM) audio file.
+    Returns a list of (start_seconds, end_seconds) speech segment tuples.
 
-    Returns: list of dicts [{"start": start_s, "end": end_s}, ...]
-    with accurate timestamps even in noisy/music conditions.
+    WHY threshold=0.35: Singing voice has different spectral characteristics
+    than clean conversational speech. Silero's default threshold (~0.5) is
+    calibrated for clean microphone speech and rejects the more tonal,
+    harmonically-rich signal of a singing voice. Lowering to 0.35 allows
+    the model to detect sustained vocal activity while still rejecting
+    pure instrumental passages.
     """
     # Load Silero VAD
     model, utils = torch.hub.load(
@@ -110,23 +111,26 @@ def run_neural_vad(file_path: str):
     (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
 
     SAMPLING_RATE = 16000
-    CHUNK_DURATION_SEC = 300       # 5-minute chunks for low RAM
+    CHUNK_DURATION_SEC = 300       # 5-minute chunks to keep RAM low
     CHUNK_SAMPLES = int(SAMPLING_RATE * CHUNK_DURATION_SEC)
 
-    # Analysis window for music/noise gate: 1 second
-    NOISE_CHECK_WINDOW = SAMPLING_RATE
-
-    all_speech_timestamps = []
-    full_audio = None  # We'll store full audio for boundary refinement
+    all_speech_timestamps: List[dict] = []
+    total_frames_analyzed = 0
+    total_speech_frames   = 0
 
     with sf.SoundFile(file_path, 'r') as f:
-        if f.samplerate != SAMPLING_RATE or f.channels != 1:
+        # Mandatory: verify the file is already standardized
+        if f.samplerate != SAMPLING_RATE:
             raise ValueError(
-                f"Expected 16000 Hz mono, got {f.samplerate} Hz {f.channels} ch. "
-                "Run convert_audio() first."
+                f"[VAD] Expected 16000 Hz input, got {f.samplerate} Hz. "
+                "Run standardize_audio() before calling run_neural_vad()."
+            )
+        if f.channels != 1:
+            raise ValueError(
+                f"[VAD] Expected mono input, got {f.channels} channels. "
+                "Run standardize_audio() before calling run_neural_vad()."
             )
 
-        audio_frames = []
         current_sample_offset = 0
 
         while True:
@@ -134,48 +138,44 @@ def run_neural_vad(file_path: str):
             if len(audio_chunk) == 0:
                 break
 
-            audio_frames.append(audio_chunk.copy())
+            chunk_tensor = torch.from_numpy(audio_chunk)
 
-            # --- Pre-VAD music/noise suppression ---
-            # Build a masked version: zero out 1s sub-windows that are music/noise
-            masked_chunk = audio_chunk.copy()
-            for sub_start in range(0, len(audio_chunk) - NOISE_CHECK_WINDOW, NOISE_CHECK_WINDOW):
-                sub_end = sub_start + NOISE_CHECK_WINDOW
-                sub_frame = audio_chunk[sub_start:sub_end]
-                if _is_music_or_noise(sub_frame, SAMPLING_RATE):
-                    # Suppress this sub-window (zero it out before VAD sees it)
-                    masked_chunk[sub_start:sub_end] = 0.0
-
-            chunk_tensor = torch.from_numpy(masked_chunk)
-
-            # --- Run Silero VAD with tighter parameters ---
+            # --- Run Silero VAD ---
+            # threshold=0.35: lower than default to catch singing + noisy speech.
+            # min_speech_duration_ms=250: short sung syllables are valid speech.
+            # min_silence_duration_ms=300: natural gaps between phrases.
             speech_timestamps = get_speech_timestamps(
                 chunk_tensor,
                 model,
                 sampling_rate=SAMPLING_RATE,
-                threshold=0.6,                  # Higher confidence required (was default ~0.5)
-                min_speech_duration_ms=600,     # Reject very short blips (was 400ms)
-                min_silence_duration_ms=400,    # Allow natural pause gaps (was 250ms)
-                speech_pad_ms=30,               # Cushion around speech edges
+                threshold=0.35,
+                min_speech_duration_ms=250,
+                min_silence_duration_ms=300,
+                speech_pad_ms=30,
             )
 
+            # Accumulate frame counts for debug logging
+            frame_samples = int(SAMPLING_RATE * 0.025)   # 25 ms frames
+            hop_samples   = int(SAMPLING_RATE * 0.010)   # 10 ms hop
+            chunk_frames  = max(0, (len(audio_chunk) - frame_samples) // hop_samples + 1)
+            total_frames_analyzed += chunk_frames
+
             for ts in speech_timestamps:
-                global_start_samples = current_sample_offset + ts['start']
-                global_end_samples = current_sample_offset + ts['end']
-                start_s = global_start_samples / SAMPLING_RATE
-                end_s = global_end_samples / SAMPLING_RATE
+                seg_frames = max(0, (ts['end'] - ts['start'] - frame_samples) // hop_samples + 1)
+                total_speech_frames += int(seg_frames)
+
+                global_start_s = (current_sample_offset + ts['start']) / SAMPLING_RATE
+                global_end_s   = (current_sample_offset + ts['end'])   / SAMPLING_RATE
                 all_speech_timestamps.append({
-                    "start": start_s,
-                    "end": end_s,
-                    "_start_sample": int(global_start_samples),
-                    "_end_sample": int(global_end_samples),
+                    "start": global_start_s,
+                    "end":   global_end_s,
                 })
 
             current_sample_offset += len(audio_chunk)
 
     # --- Merge segments across chunk boundaries ---
-    merged = []
-    MERGE_GAP = 0.5   # Merge gaps ≤ 0.5s (tighter than before)
+    merged: List[dict] = []
+    MERGE_GAP = 0.5
     for ts in all_speech_timestamps:
         if not merged:
             merged.append(ts)
@@ -184,28 +184,12 @@ def run_neural_vad(file_path: str):
         gap = ts["start"] - last["end"]
         if gap <= MERGE_GAP:
             last["end"] = ts["end"]
-            last["_end_sample"] = ts["_end_sample"]
         else:
             merged.append(ts)
 
-    # --- Post-VAD boundary refinement using energy envelope ---
-    if audio_frames:
-        full_audio = np.concatenate(audio_frames)
-        refined = []
-        for ts in merged:
-            rs, re = _refine_segment_boundaries(
-                full_audio,
-                ts["_start_sample"],
-                ts["_end_sample"],
-                SAMPLING_RATE,
-                margin_ms=50
-            )
-            start_s = rs / SAMPLING_RATE
-            end_s = re / SAMPLING_RATE
-            # Only keep if still meaningfully long after refinement
-            if end_s - start_s >= 0.2:
-                refined.append({"start": round(start_s, 3), "end": round(end_s, 3)})
-        return refined
+    # --- Debug logging ---
+    print(f"[VAD] total frames analyzed  : {total_frames_analyzed}")
+    print(f"[VAD] speech frames detected : {total_speech_frames}")
+    print(f"[VAD] number of segments     : {len(merged)}")
 
-    # Fallback: return merged without refinement
     return [{"start": round(t["start"], 3), "end": round(t["end"], 3)} for t in merged]

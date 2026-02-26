@@ -15,3 +15,5 @@ requests
 huggingface_hub<0.22.0
 openai-whisper
 librosa
+pydub
+demucs
