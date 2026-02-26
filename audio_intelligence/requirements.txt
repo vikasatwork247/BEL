@@ -1,0 +1,15 @@
+webrtcvad-wheels
+numpy<2.0,>=1.24.0
+scipy>=1.10.0
+soundfile>=0.12.1
+matplotlib>=3.7.0
+scikit-learn>=1.2.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
+torchaudio==2.2.2+cpu
+onnxruntime
+silero-vad
+speechbrain
+sentencepiece
+requests
+huggingface_hub<0.22.0
