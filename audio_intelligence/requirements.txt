@@ -9,7 +9,7 @@ torch==2.2.2+cpu
 torchaudio==2.2.2+cpu
 onnxruntime
 silero-vad
-speechbrain
+speechbrain>=1.0.0
 sentencepiece
 requests
 huggingface_hub<0.22.0
@@ -17,3 +17,9 @@ openai-whisper
 librosa
 pydub
 demucs
+# --- Added for SAD / WhisperX pipeline ---
+pyannote.audio
+whisperx
+ffmpeg-python
+transformers
+accelerate

@@ -2,24 +2,35 @@ import os
 import sys
 import argparse
 
-from src.audio_converter import convert_audio, standardize_audio
-from src.vocal_separator import separate_vocals, needs_vocal_separation
+# --------------------------------------------------------------------------- #
+# Perception pipeline (replaces VAD as the source of speech timestamps)       #
+# --------------------------------------------------------------------------- #
+from src.perception.pipeline import run_pipeline, load_segments_json
+
+# --------------------------------------------------------------------------- #
+# Analytics modules (unchanged — receive better timestamps from perception)   #
+# --------------------------------------------------------------------------- #
 from src.audio_streamer import AudioStreamer
-from src.feature_extractor import compute_mfcc
 from src.language_classifier import LanguageClassifier
 from src.analytics_engine import AnalyticsEngine
 from src.visualization import Visualization
 from src.report_generator import ReportGenerator
+from src.feature_extractor import compute_mfcc
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Audio Intelligence & Human Communication Analytics System"
     )
-    parser.add_argument("input_file", help="Path to input audio file")
+    parser.add_argument("input_file", nargs="?", help="Path to input audio file")
+    parser.add_argument("--input", dest="input_flag", help="Path to input audio file")
     args = parser.parse_args()
 
-    input_path = args.input_file
+    input_path = args.input_flag or args.input_file
+    if not input_path:
+        parser.print_help()
+        sys.exit(1)
+
     if not os.path.exists(input_path):
         print(f"Error: File '{input_path}' not found.")
         sys.exit(1)
@@ -29,68 +40,72 @@ def main():
     os.makedirs(os.path.join("outputs", "temp"), exist_ok=True)
 
     # ------------------------------------------------------------------ #
-    # STEP 1: Vocal Separation (for music / compressed audio)             #
-    # WHY: Neural VAD is trained on clean speech. Instruments mask vocal  #
-    # frequencies => every frame stays below threshold => zero segments.  #
-    # Demucs isolates only the vocals stem so VAD gets a clean signal.    #
+    # STEPS 1-4 — 4-Stage Perception Pipeline                            #
+    #                                                                     #
+    # Stage 1: Demucs vocal separation  → outputs/vocals.wav             #
+    # Stage 2: SpeechBrain neural SAD   → rough speech regions           #
+    # Stage 3: Boundary refinement      → clean, merged segments         #
+    # Stage 4: WhisperX forced align    → ms-accurate timestamps         #
+    #                                    → outputs/segments.json         #
+    #                                                                     #
+    # vad_engine.py / neural_vad.py / feature_extractor.py are NO LONGER #
+    # used to determine timestamps. They remain available for analytics. #
     # ------------------------------------------------------------------ #
-    if needs_vocal_separation(input_path):
-        print("1. Input is music/compressed — running vocal source separation (Demucs)...")
-        vocals_path = separate_vocals(input_path)
-    else:
-        print("1. Input is plain audio — skipping vocal separation.")
-        vocals_path = input_path
+    print("\n" + "=" * 60)
+    print("  PERCEPTION PIPELINE — 4-Stage Speech Boundary Detection")
+    print("=" * 60)
 
-    # ------------------------------------------------------------------ #
-    # STEP 2: Standardize Audio                                           #
-    # WHY: Silero VAD requires EXACTLY 16kHz mono float32 PCM.           #
-    # pydub handles resampling, mono conversion, and loudness norm.      #
-    # ------------------------------------------------------------------ #
-    print("2. Standardizing audio to 16kHz mono -20dBFS WAV (pydub)...")
-    standardized_path = standardize_audio(vocals_path)
+    run_pipeline(input_path)
 
-    # ------------------------------------------------------------------ #
-    # STEP 3: Neural VAD — runs ONLY on the standardized file            #
-    # ------------------------------------------------------------------ #
-    print("3. Running Neural VAD (Silero, threshold=0.35)...")
-    from src.neural_vad import run_neural_vad
-    timestamps = run_neural_vad(standardized_path)
+    # Load standardised seconds-based timestamps for analytics
+    timestamps = load_segments_json()       # [{'start': s, 'end': s}, ...]
+
+    n_segments = len(timestamps)
+    print(f"\nSpeech segments detected: {n_segments}")
 
     if not timestamps:
-        print("WARNING: No speech segments detected. Check the audio content.")
+        print("WARNING: No speech segments detected. "
+              "Check the audio content and try again.")
 
     # ------------------------------------------------------------------ #
-    # STEP 4: Feature extraction and language detection                   #
-    # Language classifier runs ONLY on detected speech segments          #
+    # STEP 5 — Feature extraction & language detection                   #
+    # (operates on outputs/vocals.wav — already 16 kHz mono)             #
     # ------------------------------------------------------------------ #
-    print("4. Extracting features and detecting language from speech segments...")
-    features = compute_mfcc(standardized_path, timestamps)
+    vocals_path = os.path.join("outputs", "vocals.wav")
+    analysis_path = vocals_path if os.path.exists(vocals_path) else input_path
+
+    print("\n" + "=" * 60)
+    print("  ANALYTICS  — Language, Features, Behaviour")
+    print("=" * 60)
+
+    print("5. Extracting features and detecting language …")
+    features = compute_mfcc(analysis_path, timestamps)
     clf = LanguageClassifier()
-    language, conf = clf.predict(standardized_path, timestamps)
+    language, conf = clf.predict(analysis_path, timestamps)
 
     # ------------------------------------------------------------------ #
-    # STEP 5: Analytics                                                   #
+    # STEP 6 — Analytics engine                                           #
     # ------------------------------------------------------------------ #
-    print("5. Analyzing communication behavior...")
-    streamer = AudioStreamer(standardized_path, frame_duration_ms=20)
+    print("6. Analysing communication behaviour …")
+    streamer = AudioStreamer(analysis_path, frame_duration_ms=20)
     total_duration = streamer.get_duration()
     analytics = AnalyticsEngine(timestamps, total_duration)
     stats = analytics.synthesize()
 
-    stats["language"] = language
+    stats["language"]            = language
     stats["language_confidence"] = conf
 
     # ------------------------------------------------------------------ #
-    # STEP 6: Visualizations                                              #
+    # STEP 7 — Visualisations                                             #
     # ------------------------------------------------------------------ #
-    print("6. Generating visualizations...")
+    print("7. Generating visualisations …")
     viz = Visualization(timestamps, total_duration)
     viz.generate_all()
 
     # ------------------------------------------------------------------ #
-    # STEP 7: Reports                                                     #
+    # STEP 8 — Reports                                                    #
     # ------------------------------------------------------------------ #
-    print("7. Generating final reports...")
+    print("8. Generating final reports …")
     report_gen = ReportGenerator(timestamps, stats)
     report_gen.export_csv("outputs/speech_segments.csv")
     report_gen.export_txt("outputs/report.txt")
